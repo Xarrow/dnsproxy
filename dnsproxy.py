@@ -100,20 +100,35 @@ import struct
 
 class DNSServer(gevent.server.DatagramServer):
     """DNS Proxy over TCP to avoid DNS poisoning"""
+    remote_address = ('8.8.8.8', 53)
+    max_retry = 3
+    timeout   = 3
+
     def __init__(self, *args, **kwargs):
         gevent.server.DatagramServer.__init__(self, *args, **kwargs)
         self.cache = {}
     def handle(self, data, address):
-        cache  = self.cache
-        reqid  = data[:2]
-        domain = data[12:data.find('\x00', 12)]
+        cache   = self.cache
+        timeout = self.timeout
+        reqid   = data[:2]
+        domain  = data[12:data.find('\x00', 12)]
         if domain not in cache:
             qname = re.sub(r'[\x01-\x10]', '.', domain[1:])
-            logging.info('DNSServer resolve domain=%r to iplist', qname)
-            remote_sock = socket.create_connection(('8.8.8.8', 53))
-            remote_sock.sendall(struct.pack('!h', len(data)) + data)
-            remote_data = remote_sock.recv(512)
-            cache[domain] = remote_data[2:]
+            for i in xrange(self.max_retry):
+                logging.info('DNSServer resolve domain=%r to iplist', qname)
+                remote_sock = None
+                try:
+                    remote_sock = socket.create_connection(self.remote_address, timeout=timeout)
+                    remote_sock.sendall(struct.pack('!h', len(data)) + data)
+                    remote_data = remote_sock.recv(512)
+                    if remote_data:
+                        cache[domain] = remote_data[2:]
+                        break
+                except socket.error as e:
+                    logging.error('DNSServer resolve domain=%r to iplist failed:%s', qname, e)
+                finally:
+                    if remote_sock:
+                        remote_sock.close()
         reply = reqid + cache[domain][2:]
         self.sendto(reply, address)
 
