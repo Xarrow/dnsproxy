@@ -101,53 +101,40 @@ import collections
 
 class DNSServer(gevent.server.DatagramServer):
     """DNS Proxy over TCP to avoid DNS poisoning"""
-    upstream_address = ('8.8.8.8', 53)
+    remote_address = ('8.8.8.8', 53)
     max_retry = 3
     max_cache_size = 2000
     timeout   = 3
-    poolsize  = 10
 
     def __init__(self, *args, **kwargs):
         gevent.server.DatagramServer.__init__(self, *args, **kwargs)
-        self._cache = {}
-        self._dispatchinfo = collections.defaultdict(list)
-        self._dispatchlet = None
-        self._dispatchlet_lock = gevent.coros.Semaphore()
-        self._upstream_sock = None
-        self._upstream_sock_writelock = gevent.coros.Semaphore()
-    def _dispath(self, sock):
-        rfile = sock.makefile('rb', 8192)
-        while 1:
-            tcpheader = rfile.read(2)
-            length = struct.unpack('!h', tcpheader)[0]
-            udpdata = rfile.read(length)
-            reqid = udpdata[:2]
-            domain = udpdata[12:udpdata.find('\x00', 12)]
-            self._cache[domain] = udpdata
-            addresses = self._dispatchinfo.pop((reqid, domain), [])
-            for address in addresses:
-                self.sendto(reqid+udpdata[2:], address)
-    def _connect(self, address):
-        with self._dispatchlet_lock:
-            if self._dispatchlet is not None:
-                self._dispatchlet.kill()
-            self._upstream_sock = socket.create_connection(address, timeout=self.timeout)
-            self._dispatchlet = gevent.spawn(self._dispath, self._upstream_sock.dup())
+        self.cache = {}
     def handle(self, data, address):
-        if self._dispatchlet is None:
-            self._connect(self.upstream_address)
+        cache   = self.cache
+        timeout = self.timeout
         reqid   = data[:2]
         domain  = data[12:data.find('\x00', 12)]
-        if len(self._cache) > self.max_cache_size:
-            self._cache.clear()
-        try:
-            self.sendto(reqid+self._cache[domain][2:], address)
-        except KeyError:
-            self._dispatchinfo[reqid, domain].append(address)
-            qname = re.sub(r'[\x01-\x1f]', '.', domain[1:])
-            logging.info('DNSServer resolve domain=%r to iplist', qname)
-            with self._upstream_sock_writelock:
-                self._upstream_sock.sendall(struct.pack('!h', len(data)) + data)
+        if len(cache) > self.max_cache_size:
+            cache.clear()
+        if domain not in cache:
+            qname = re.sub(r'[\x01-\x10]', '.', domain[1:])
+            for i in xrange(self.max_retry):
+                logging.info('DNSServer resolve domain=%r to iplist', qname)
+                remote_sock = None
+                try:
+                    remote_sock = socket.create_connection(self.remote_address, timeout=timeout)
+                    remote_sock.sendall(struct.pack('!h', len(data)) + data)
+                    remote_data = remote_sock.recv(512)
+                    if remote_data:
+                        cache[domain] = remote_data[2:]
+                        break
+                except socket.error as e:
+                    logging.error('DNSServer resolve domain=%r to iplist failed:%s', qname, e)
+                finally:
+                    if remote_sock:
+                        remote_sock.close()
+        reply = reqid + cache[domain][2:]
+        self.sendto(reply, address)
 
 def main():
     logging.basicConfig(level=logging.DEBUG, format='%(levelname)s - %(asctime)s %(message)s', datefmt='[%b %d %H:%M:%S]')
