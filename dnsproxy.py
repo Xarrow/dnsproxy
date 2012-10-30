@@ -102,9 +102,11 @@ import collections
 class DNSServer(gevent.server.DatagramServer):
     """DNS Proxy over TCP to avoid DNS poisoning"""
     remote_address = ('8.8.8.8', 53)
-    max_retry = 3
+    max_wait = 2
+    max_retry = 2
     max_cache_size = 2000
     timeout   = 3
+    dns_blacklist = set(['203.98.7.65','159.106.121.75','159.24.3.173','46.82.174.68','78.16.49.15','59.24.3.173','243.185.187.39','243.185.187.30','8.7.198.45','37.61.54.158','93.46.8.89',])
 
     def __init__(self, *args, **kwargs):
         gevent.server.DatagramServer.__init__(self, *args, **kwargs)
@@ -112,29 +114,45 @@ class DNSServer(gevent.server.DatagramServer):
     def handle(self, data, address):
         cache   = self.cache
         timeout = self.timeout
+        remote_address = self.remote_address
         reqid   = data[:2]
         domain  = data[12:data.find('\x00', 12)]
         if len(cache) > self.max_cache_size:
             cache.clear()
-        if domain not in cache:
+        if domain in cache:
+            return self.sendto(reqid + cache[domain][2:], address)
+        retry = 0
+        while domain not in cache:
             qname = re.sub(r'[\x01-\x10]', '.', domain[1:])
-            for i in xrange(self.max_retry):
-                logging.info('DNSServer resolve domain=%r to iplist', qname)
-                remote_sock = None
-                try:
-                    remote_sock = socket.create_connection(self.remote_address, timeout=timeout)
-                    remote_sock.sendall(struct.pack('!h', len(data)) + data)
-                    remote_data = remote_sock.recv(512)
-                    if remote_data:
-                        cache[domain] = remote_data[2:]
+            logging.info('DNSServer resolve domain=%r to iplist', qname)
+            sock = None
+            try:
+                data = '%s\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00%s\x00\x00\x01\x00\x01' % (os.urandom(2), domain)
+                address_family = socket.AF_INET6 if ':' in remote_address[0] else socket.AF_INET
+                sock = socket.socket(family=address_family, type=socket.SOCK_DGRAM)
+                if isinstance(timeout, (int, long)):
+                    sock.settimeout(timeout)
+                sock.sendto(data, remote_address)
+                for i in xrange(self.max_wait):
+                    print (i, )
+                    data, address = sock.recvfrom(512)
+                    iplist = ['.'.join(str(ord(x)) for x in s) for s in re.findall('\x00\x01\x00\x01.{6}(.{4})', data)]
+                    if not any(x in self.dns_blacklist for x in iplist):
+                        if not iplist:
+                            logging.info('DNS return unkown result, iplist=%s', iplist)
+                        cache[domain] = data
+                        self.sendto(reqid + cache[domain][2:], address)
                         break
-                except socket.error as e:
-                    logging.error('DNSServer resolve domain=%r to iplist failed:%s', qname, e)
-                finally:
-                    if remote_sock:
-                        remote_sock.close()
-        reply = reqid + cache[domain][2:]
-        self.sendto(reply, address)
+                    else:
+                        logging.info('DNS Poisoning return %s from %s', iplist, sock)
+            except socket.error as e:
+                logging.error('DNSServer resolve domain=%r to iplist failed:%s', qname, e)
+            finally:
+                if sock:
+                    sock.close()
+                retry += 1
+                if retry >= self.max_retry:
+                    break
 
 def main():
     logging.basicConfig(level=logging.DEBUG, format='%(levelname)s - %(asctime)s %(message)s', datefmt='[%b %d %H:%M:%S]')
