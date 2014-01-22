@@ -123,6 +123,7 @@ class DNSServer(gevent.server.DatagramServer):
                                 if reply.rr:
                                     reply_ttl = max(x.ttl for x in reply.rr)
                                 logging.info('query qname=%r reply iplist=%s, ttl=%r', qname, iplist, reply_ttl)
+                                self.dns_cache.set((qname, qtype), reply_data, reply_ttl * 2)
                                 break
             except socket.error as e:
                 logging.warning('handle dns data=%r socket: %r', data, e)
@@ -131,7 +132,6 @@ class DNSServer(gevent.server.DatagramServer):
         for sock in socks:
             sock.close()
         if reply_data:
-            self.dns_cache.set((qname, qtype), reply_data, reply_ttl * 2)
             return self.sendto(data[:2] + reply_data[2:], address)
 
 
