@@ -1,5 +1,9 @@
 #!/usr/bin/env python
 # coding:utf-8
+# TODO: 1. improve LRU Cache performance
+#       2. sort reply rdata by ip latency
+#       3. add tcp query mode
+
 
 __version__ = '1.0'
 
@@ -16,52 +20,65 @@ gevent.monkey.patch_all(subprocess=True)
 
 import time
 import logging
+import collections
+import heapq
 import socket
 import select
 import dnslib
 
+class ExpireDict(object):
+    """ A dictionary-like object, supporting expire semantics."""
+    def __init__(self, max_size=1024):
+        self.max_size = max_size
+        self.__values = {}
+        self.__expire_times = collections.OrderedDict()
 
-class LRUCache(object):
-    """http://pypi.python.org/pypi/lru/"""
+    def size(self):
+        return len(self.__values)
 
-    def __init__(self, max_items=100):
-        self.cache = {}
-        self.key_order = []
-        self.max_items = max_items
+    def clear(self):
+        self.__values.clear()
+        self.__expire_times.clear()
 
-    def __setitem__(self, key, value):
-        self.cache[key] = value
-        self._mark(key)
+    def exists(self, key):
+        return key in self.__values
 
-    def __getitem__(self, key):
-        value = self.cache[key]
-        self._mark(key)
-        return value
+    def set(self, key, value, expire=0):
+        self.__values[key] = value
+        if expire:
+            self.__expire_times[key] = int(time.time() + expire)
+        self.cleanup()
 
-    def __delitem__(self, key):
-        del self.cache[key]
-        self.key_order.remove(key)
+    def get(self, key):
+        et = self.__expire_times.get(key, None)
+        if et and et < time.time():
+            del self.__values[key], self.__expire_times[key]
+            self.cleanup()
+            raise KeyError(key)
+        return self.__values[key]
 
-    def _mark(self, key):
-        if key in self.key_order:
-            self.key_order.remove(key)
-        self.key_order.insert(0, key)
-        if len(self.key_order) > self.max_items:
-            remove = self.key_order[self.max_items]
-            del self.cache[remove]
-            self.key_order.pop(self.max_items)
+    def delete(self, key):
+        del self.__values[key], self.__expire_times[key]
+
+    def cleanup(self):
+        t = int(time.time())
+        #Delete expired
+        any(self.delete(k) for k, et in self.__expire_times.iteritems() if et < t)
+        #If we have more than self.max_size items, delete the oldest
+        over_size = len(self.__values) - self.max_size
+        if over_size > 0:
+            any(self.delete(x) for x in heapq.nsmallest(over_size, self.__expire_times, key=self.__expire_times.get))
 
 
 class DNSServer(gevent.server.DatagramServer):
     """DNS TCP Proxy based on gevent/dnslib"""
 
-    def __init__(self, dns_servers, dns_backlist, dns_timeout, *args, **kwargs):
+    def __init__(self, dns_servers, dns_backlist, *args, **kwargs):
         super(self.__class__, self).__init__(*args, **kwargs)
         self.dns_v4_servers = [x for x in dns_servers if ':' not in x]
         self.dns_v6_servers = [x for x in dns_servers if ':' in x]
-        self.dns_backlist = frozenset(dns_backlist)
-        self.dns_timeout = int(dns_timeout)
-        self.dns_cache = LRUCache(2048)
+        self.dns_backlist = set(dns_backlist)
+        self.dns_cache = ExpireDict(max_size=4096)
 
     def handle(self, data, address):
         logging.debug('receive from %r data=%r', address, data)
@@ -69,10 +86,7 @@ class DNSServer(gevent.server.DatagramServer):
         qname = str(request.q.qname)
         qtype = request.q.qtype
         try:
-            reply_data, mtime = self.dns_cache[qname, qtype]
-            if time.time() - mtime > self.dns_timeout:
-                del self.dns_cache[qname, qtype]
-                reply_data = ''
+            reply_data = self.dns_cache.get((qname, qtype))
         except KeyError:
             reply_data = ''
         sock_v4 = sock_v6 = None
@@ -83,6 +97,7 @@ class DNSServer(gevent.server.DatagramServer):
         if self.dns_v6_servers:
             sock_v6 = gevent.socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
             socks.append(sock_v6)
+        reply_ttl = 600
         for _ in xrange(2):
             if reply_data:
                 break
@@ -101,10 +116,12 @@ class DNSServer(gevent.server.DatagramServer):
                             reply = dnslib.DNSRecord.parse(reply_data)
                             iplist = [str(x.rdata) for x in reply.rr]
                             if any(x in self.dns_backlist for x in iplist):
-                                logging.warning('query %r return bad rdata=%r', qname, [str(x.rdata) for x in reply.rr])
+                                logging.warning('query qname=%r reply bad iplist=%r', qname, iplist)
                                 reply_data = ''
                             else:
-                                logging.info('qname=%r reply iplist=%s', qname, iplist)
+                                if reply.rr:
+                                    reply_ttl = max(x.ttl for x in reply.rr)
+                                logging.info('query qname=%r reply iplist=%s, ttl=%r', qname, iplist, reply_ttl)
                                 break
             except socket.error as e:
                 logging.warning('handle dns data=%r socket: %r', data, e)
@@ -113,7 +130,7 @@ class DNSServer(gevent.server.DatagramServer):
         for sock in socks:
             sock.close()
         if reply_data:
-            self.dns_cache[qname, qtype] = (reply_data, time.time())
+            self.dns_cache.set((qname, qtype), reply_data, reply_ttl * 2)
             return self.sendto(data[:2] + reply_data[2:], address)
 
 
@@ -122,7 +139,7 @@ def test():
     dnsservers = ['114.114.114.114']
     backlist = '1.1.1.1|255.255.255.255|74.125.127.102|74.125.155.102|74.125.39.102|74.125.39.113|209.85.229.138|4.36.66.178|8.7.198.45|37.61.54.158|46.82.174.68|59.24.3.173|64.33.88.161|64.33.99.47|64.66.163.251|65.104.202.252|65.160.219.113|66.45.252.237|72.14.205.104|72.14.205.99|78.16.49.15|93.46.8.89|128.121.126.139|159.106.121.75|169.132.13.103|192.67.198.6|202.106.1.2|202.181.7.85|203.161.230.171|203.98.7.65|207.12.88.98|208.56.31.43|209.145.54.50|209.220.30.174|209.36.73.33|209.85.229.138|211.94.66.147|213.169.251.35|216.221.188.182|216.234.179.13|243.185.187.3|243.185.187.39'.split('|')
     logging.info('serving at port 53...')
-    DNSServer(dnsservers, backlist, 1800, ('', 53)).serve_forever()
+    DNSServer(dnsservers, backlist, ('', 53)).serve_forever()
 
 
 if __name__ == '__main__':
