@@ -1,4 +1,4 @@
 dnsproxy
 ========
 
-DNS Proxy over TCP to avoid DNS poisoning
+DNS Proxy to avoid DNS poisoning
