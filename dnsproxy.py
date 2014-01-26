@@ -48,7 +48,8 @@ class ExpireCache(object):
             et = self.__expire_times[key]
             pos = self.__expire_heap.index((et, key))
             del self.__expire_heap[pos]
-            heapq._siftup(self.__expire_heap, pos)
+            if pos < len(self.__expire_heap):
+                heapq._siftup(self.__expire_heap, pos)
         except KeyError:
             pass
         et = int(time.time() + expire)
@@ -68,7 +69,8 @@ class ExpireCache(object):
         et = self.__expire_times.pop(key)
         pos = self.__expire_heap.index((et, key))
         del self.__expire_heap[pos]
-        heapq._siftup(self.__expire_heap, pos)
+        if pos < len(self.__expire_heap):
+            heapq._siftup(self.__expire_heap, pos)
         del self.__values[key]
 
     def cleanup(self):
@@ -89,12 +91,14 @@ class DNSServer(gevent.server.DatagramServer):
 
     def __init__(self, *args, **kwargs):
         dns_servers = kwargs.pop('dns_servers')
-        dns_backlist = kwargs.pop('dns_backlist')
+        dns_blacklist = kwargs.pop('dns_blacklist')
+        dns_timeout = kwargs.pop('dns_timeout', 2)
         super(self.__class__, self).__init__(*args, **kwargs)
         self.dns_v4_servers = [x for x in dns_servers if ':' not in x]
         self.dns_v6_servers = [x for x in dns_servers if ':' in x]
-        self.dns_backlist = set(dns_backlist)
+        self.dns_blacklist = set(dns_blacklist)
         self.dns_cache = ExpireCache(max_size=65536)
+        self.dns_timeout = int(dns_timeout)
 
     def handle(self, data, address):
         logging.debug('receive from %r data=%r', address, data)
@@ -121,27 +125,25 @@ class DNSServer(gevent.server.DatagramServer):
                     sock_v4.sendto(data, (dnsserver, 53))
                 for dnsserver in self.dns_v6_servers:
                     sock_v6.sendto(data, (dnsserver, 53))
-                with gevent.timeout.Timeout(2):
-                    while True:
-                        if reply_data:
+                timeout_at = time.time() + self.dns_timeout
+                while time.time() < timeout_at:
+                    if reply_data:
+                        break
+                    ins, _, _ = select.select(socks, [], [], 0.1)
+                    for sock in ins:
+                        reply_data, _ = sock.recvfrom(512)
+                        reply = dnslib.DNSRecord.parse(reply_data)
+                        iplist = [str(x.rdata) for x in reply.rr]
+                        if any(x in self.dns_blacklist for x in iplist):
+                            logging.warning('query qname=%r reply bad iplist=%r', qname, iplist)
+                            reply_data = ''
+                        else:
+                            ttl = max(x.ttl for x in reply.rr) if reply.rr else 600
+                            logging.debug('query qname=%r qtype=%r reply iplist=%s, ttl=%r', qname, qtype, iplist, ttl)
+                            self.dns_cache.set((qname, qtype), reply_data, ttl*2)
                             break
-                        ins, _, _ = select.select(socks, [], [], 0.1)
-                        for sock in ins:
-                            reply_data, _ = sock.recvfrom(512)
-                            reply = dnslib.DNSRecord.parse(reply_data)
-                            iplist = [str(x.rdata) for x in reply.rr]
-                            if any(x in self.dns_backlist for x in iplist):
-                                logging.warning('query qname=%r reply bad iplist=%r', qname, iplist)
-                                reply_data = ''
-                            else:
-                                ttl = max(x.ttl for x in reply.rr) if reply.rr else 600
-                                logging.info('query qname=%r qtype=%r reply iplist=%s, ttl=%r', qname, qtype, iplist, ttl)
-                                self.dns_cache.set((qname, qtype), reply_data, ttl*2)
-                                break
             except socket.error as e:
                 logging.warning('handle dns data=%r socket: %r', data, e)
-            except gevent.timeout.Timeout as e:
-                logging.warning('handle dns data=%r timeout: %r', data, e)
         for sock in socks:
             sock.close()
         if reply_data:
@@ -151,9 +153,9 @@ class DNSServer(gevent.server.DatagramServer):
 def test():
     logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(asctime)s %(message)s', datefmt='[%b %d %H:%M:%S]')
     dns_servers = ['8.8.8.8', '114.114.114.114']
-    dns_backlist = '1.1.1.1|255.255.255.255|74.125.127.102|74.125.155.102|74.125.39.102|74.125.39.113|209.85.229.138|4.36.66.178|8.7.198.45|37.61.54.158|46.82.174.68|59.24.3.173|64.33.88.161|64.33.99.47|64.66.163.251|65.104.202.252|65.160.219.113|66.45.252.237|72.14.205.104|72.14.205.99|78.16.49.15|93.46.8.89|128.121.126.139|159.106.121.75|169.132.13.103|192.67.198.6|202.106.1.2|202.181.7.85|203.161.230.171|203.98.7.65|207.12.88.98|208.56.31.43|209.145.54.50|209.220.30.174|209.36.73.33|209.85.229.138|211.94.66.147|213.169.251.35|216.221.188.182|216.234.179.13|243.185.187.3|243.185.187.39'.split('|')
+    dns_blacklist = '1.1.1.1|255.255.255.255|74.125.127.102|74.125.155.102|74.125.39.102|74.125.39.113|209.85.229.138|4.36.66.178|8.7.198.45|37.61.54.158|46.82.174.68|59.24.3.173|64.33.88.161|64.33.99.47|64.66.163.251|65.104.202.252|65.160.219.113|66.45.252.237|72.14.205.104|72.14.205.99|78.16.49.15|93.46.8.89|128.121.126.139|159.106.121.75|169.132.13.103|192.67.198.6|202.106.1.2|202.181.7.85|203.161.230.171|203.98.7.65|207.12.88.98|208.56.31.43|209.145.54.50|209.220.30.174|209.36.73.33|209.85.229.138|211.94.66.147|213.169.251.35|216.221.188.182|216.234.179.13|243.185.187.3|243.185.187.39'.split('|')
     logging.info('serving at port 53...')
-    DNSServer(('', 53), dns_servers=dns_servers, dns_backlist=dns_backlist).serve_forever()
+    DNSServer(('', 53), dns_servers=dns_servers, dns_blacklist=dns_blacklist).serve_forever()
 
 
 if __name__ == '__main__':
