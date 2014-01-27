@@ -131,11 +131,16 @@ class DNSServer(gevent.server.DatagramServer):
                         break
                     ins, _, _ = select.select(socks, [], [], 0.1)
                     for sock in ins:
+                        # http://technet.microsoft.com/zh-cn/library/dd197470.aspx
                         reply_data, _ = sock.recvfrom(512)
                         reply = dnslib.DNSRecord.parse(reply_data)
+                        if reply.header.rcode:
+                            logging.warning('query qname=%r reply nonzero rcode=%r, ignore.', qname, reply.header.rcode)
+                            reply_data = ''
+                            continue
                         iplist = [str(x.rdata) for x in reply.rr]
                         if any(x in self.dns_blacklist for x in iplist):
-                            logging.warning('query qname=%r reply bad iplist=%r', qname, iplist)
+                            logging.warning('query qname=%r reply bad iplist=%r, ignore.', qname, iplist)
                             reply_data = ''
                         else:
                             ttl = max(x.ttl for x in reply.rr) if reply.rr else 600
