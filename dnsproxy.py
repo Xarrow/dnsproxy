@@ -224,7 +224,7 @@ class DNSServer(gevent.server.DatagramServer):
     def __init__(self, *args, **kwargs):
         dns_blacklist = kwargs.pop('dns_blacklist')
         dns_servers = kwargs.pop('dns_servers')
-        dns_tcpover = kwargs.pop('dns_tcpover')
+        dns_tcpover = kwargs.pop('dns_tcpover', [])
         dns_timeout = kwargs.pop('dns_timeout', 2)
         super(self.__class__, self).__init__(*args, **kwargs)
         self.dns_servers = list(dns_servers)
