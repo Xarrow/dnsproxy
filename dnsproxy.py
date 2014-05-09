@@ -251,7 +251,7 @@ class DNSServer(gevent.server.DatagramServer):
         if 'USERDNSDOMAIN' in os.environ:
             user_dnsdomain = '.' + os.environ['USERDNSDOMAIN'].lower()
             if qname.endswith(user_dnsdomain):
-                qname = qname.rstrip(user_dnsdomain)
+                qname = qname[:-len(user_dnsdomain)]
                 if '.' not in qname:
                     if not self.dns_intranet_servers:
                         logging.warning('qname=%r is a plain hostname, need intranet dns server!!!', qname)
