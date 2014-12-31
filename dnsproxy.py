@@ -9,6 +9,13 @@ import sysconfig
 
 sys.path += [os.path.abspath(os.path.join(__file__, '../packages.egg/%s' % x)) for x in ('noarch', sysconfig.get_platform().split('-')[0])]
 
+# load uvent before gevent
+# this will fix the bug on Mac OS X
+# check the issue 19254
+# https://code.google.com/p/goagent/issues/detail?id=19254
+import uvent
+uvent.install()
+
 import gevent
 import gevent.server
 import gevent.timeout
